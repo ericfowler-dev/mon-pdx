@@ -3,7 +3,7 @@ services:
     name: pdx-daily-report-cron
     runtime: node
     plan: starter
-    schedule: '0 19 * * *'
+    schedule: '0 0-2,14-23 * * *'
     buildCommand: npm ci
     startCommand: node generate-pdx-daily-report.js --force
     envVars:
