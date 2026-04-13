@@ -1,0 +1,23 @@
+{
+  "name": "stack-svy-report-render",
+  "version": "1.0.0",
+  "description": "Monday.com report scripts",
+  "main": "generate-email-report.js",
+  "scripts": {
+    "start": "node generate-email-report.js",
+    "dev": "nodemon generate-email-report.js",
+    "pdx:report": "node generate-pdx-daily-report.js",
+    "pdx:test-graph": "node test-pdx-graph-mail.js"
+  },
+  "dependencies": {
+    "@microsoft/microsoft-graph-client": "^3.0.7",
+    "@mondaydotcomorg/api": "^1.0.0",
+    "dotenv": "^17.2.3",
+    "isomorphic-fetch": "^3.0.0",
+    "nodemailer": "^6.9.15",
+    "redis": "^5.11.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
