@@ -9,6 +9,7 @@ const config = require('./pdx-daily-report.config');
 const client = new ApiClient(process.env.MONDAY_API_TOKEN);
 const SHARED_HISTORY_FILE = path.join(__dirname, 'history.json');
 const HISTORY_FILE = path.join(__dirname, 'history-pdx-daily.json');
+const HISTORY_SEED_FILE = path.join(__dirname, 'pdx-history-seed.json');
 const LAST_RUN_FILE = path.join(__dirname, 'last_run_pdx_daily.txt');
 const ACTIVITY_LOOKBACK_DAYS = [1, 2, 3, 4, 5];
 const REDIS_HISTORY_KEY = process.env.REDIS_HISTORY_KEY || 'pdx:history';
@@ -61,14 +62,6 @@ async function generateReport() {
 
         const boardItems = await fetchBoardItems(board);
         const summary = summarizeBoard(board, boardItems, comparison.data, historyForBoard, todayKey);
-        const currentBoardHistory = {
-            ...historyForBoard,
-            [todayKey]: {
-                ...(historyForBoard[todayKey] || {}),
-                [board.id]: summary.boardStats.openItems
-            }
-        };
-
         const pdxHistoryToSave = {
             ...pdxHistory,
             [todayKey]: {
@@ -81,7 +74,7 @@ async function generateReport() {
 
         const recentClosedItems = buildRecentClosedItems(boardItems, config.RECENT_CLOSED_DAYS);
         const closedCountsByDate = buildClosedCountsByDate(boardItems);
-        const htmlContent = generateEmailHTML(workspaceName, board, summary.boardStats, recentClosedItems, currentBoardHistory, closedCountsByDate);
+        const htmlContent = generateEmailHTML(workspaceName, board, summary.boardStats, recentClosedItems, closedCountsByDate);
         const csvContent = generateCSV(board, summary.boardStats, recentClosedItems);
 
         const outputFiles = saveOutputs(htmlContent, csvContent);
@@ -138,16 +131,26 @@ async function createRuntimeStore() {
             await redisClient.set(REDIS_LAST_RUN_KEY, todayKey);
         },
         async readPdxHistory() {
+            const seedHistory = readHistoryFile(HISTORY_SEED_FILE);
             const value = await redisClient.get(REDIS_HISTORY_KEY);
             if (value) {
                 try {
-                    return JSON.parse(value);
+                    const redisHistory = JSON.parse(value);
+                    return mergeDateStores(seedHistory, redisHistory);
                 } catch (error) {
                     throw new Error(`Unable to parse Redis history key ${REDIS_HISTORY_KEY}: ${error.message}`);
                 }
             }
 
-            return readHistoryFile(HISTORY_FILE);
+            const fileHistory = readHistoryFile(HISTORY_FILE);
+            const mergedSeedHistory = mergeDateStores(seedHistory, fileHistory);
+
+            if (Object.keys(mergedSeedHistory).length > 0) {
+                console.log(`Bootstrapping Redis history from bundled seed/file history into ${REDIS_HISTORY_KEY}.`);
+                await redisClient.set(REDIS_HISTORY_KEY, JSON.stringify(mergedSeedHistory));
+            }
+
+            return mergedSeedHistory;
         },
         async writePdxHistory(historyStore) {
             await redisClient.set(REDIS_HISTORY_KEY, JSON.stringify(historyStore));
@@ -523,6 +526,23 @@ function readHistoryFile(filePath) {
     }
 }
 
+function mergeDateStores(primaryStore, secondaryStore) {
+    const merged = {};
+    const allDates = new Set([
+        ...Object.keys(primaryStore || {}),
+        ...Object.keys(secondaryStore || {})
+    ]);
+
+    [...allDates].sort().forEach(date => {
+        merged[date] = {
+            ...(primaryStore?.[date] || {}),
+            ...(secondaryStore?.[date] || {})
+        };
+    });
+
+    return merged;
+}
+
 function mergeBoardHistory(sharedHistory, localHistory, boardId) {
     const merged = {};
     const allDates = new Set([
@@ -701,192 +721,63 @@ async function sendEmailViaGraph(htmlContent, csvContent, csvFileName) {
     console.log(`  Email sent via Microsoft Graph: ${recipientValue}`);
 }
 
-function prepareChartData(historyStore, boardStats) {
-    const chartData = {};
-    const sortedDates = Object.keys(historyStore).sort();
 
-    for (const board of boardStats) {
-        const snapshotPoints = [];
-        for (const date of sortedDates) {
-            if (historyStore[date] && historyStore[date][board.id] !== undefined) {
-                snapshotPoints.push({ date, count: historyStore[date][board.id] });
-            }
-        }
-        chartData[board.id] = expandToDailyPoints(snapshotPoints);
-    }
-
-    return chartData;
-}
-
-function generateSparklineHTML(points, days) {
-    if (!points || points.length < 3) {
-        return '<span style="color: #94a3b8; font-size: 11px;">--</span>';
-    }
-
+function generateClosedByDateHTML(closedCountsByDate, lookbackDays = 30) {
     const cutoff = new Date();
-    cutoff.setDate(cutoff.getDate() - days);
-    const filtered = points.filter(point => parseDateKey(point.date) >= cutoff);
+    cutoff.setHours(0, 0, 0, 0);
+    cutoff.setDate(cutoff.getDate() - lookbackDays);
 
-    if (filtered.length < 3) {
-        return '<span style="color: #94a3b8; font-size: 11px;">--</span>';
+    const dateCounts = [];
+    const cursor = new Date(cutoff);
+    const today = new Date();
+    today.setHours(23, 59, 59, 999);
+
+    while (cursor <= today) {
+        const dateKey = formatDateKey(cursor);
+        dateCounts.push({ date: dateKey, count: closedCountsByDate[dateKey] || 0 });
+        cursor.setDate(cursor.getDate() + 1);
     }
 
-    let sampled = filtered;
-    if (filtered.length > 15) {
-        sampled = [];
-        for (let index = 0; index < 15; index += 1) {
-            const sampledIndex = Math.round((index / 14) * (filtered.length - 1));
-            sampled.push(filtered[sampledIndex]);
-        }
-    }
+    const totalClosed = dateCounts.reduce((sum, entry) => sum + entry.count, 0);
+    const daysWithClosures = dateCounts.filter(entry => entry.count > 0).length;
+    const peakDay = dateCounts.reduce((best, entry) => entry.count > best.count ? entry : best, { date: '', count: 0 });
+    const avgPerDay = dateCounts.length > 0 ? (totalClosed / dateCounts.length).toFixed(1) : '0';
 
-    const counts = sampled.map(point => point.count);
-    const maxVal = Math.max(...counts) || 1;
-    const first = sampled[0].count;
-    const last = sampled[sampled.length - 1].count;
-    const barColor = last < first ? '#10b981' : (last > first ? '#ef4444' : '#64748b');
-    const maxHeight = 24;
-
-    let barsHtml = '<table cellpadding="0" cellspacing="1" border="0"><tr>';
-    for (const point of sampled) {
-        const barHeight = Math.max(Math.round((point.count / maxVal) * maxHeight), 2);
-        const spacerHeight = maxHeight - barHeight;
-        barsHtml += `<td width="5" valign="bottom" style="padding: 0;">
-            <table cellpadding="0" cellspacing="0" border="0" width="5">
-                ${spacerHeight > 0 ? `<tr><td height="${spacerHeight}" style="font-size:1px; line-height:1px;">&nbsp;</td></tr>` : ''}
-                <tr><td height="${barHeight}" bgcolor="${barColor}" style="font-size:1px; line-height:1px;">&nbsp;</td></tr>
-            </table>
-        </td>`;
-    }
-    barsHtml += '</tr></table>';
-
-    return `<table cellpadding="0" cellspacing="0" border="0" style="margin: 0 auto;"><tr>
-        <td valign="bottom" style="padding: 0 3px 1px 0; font-size: 9px; font-weight: bold; color: #94a3b8;">${first}</td>
-        <td valign="bottom" style="padding: 0;">${barsHtml}</td>
-        <td valign="bottom" style="padding: 0 0 1px 3px; font-size: 9px; font-weight: bold; color: ${barColor};">${last}</td>
-    </tr></table>`;
-}
-
-function generateDetailChartHTML(chartData, boardStats) {
-    const eligible = boardStats.filter(board => chartData[board.id] && chartData[board.id].length >= 3);
-
-    if (eligible.length === 0) {
-        return '';
-    }
-
-    let rows = '';
-    const maxHeight = 36;
-
-    eligible.forEach((board, index) => {
-        const color = '#3b82f6';
-        const points = chartData[board.id];
-        const counts = points.map(point => point.count);
-        const maxVal = Math.max(...counts) || 1;
-        const minVal = Math.min(...counts);
-        const first = points[0].count;
-        const last = points[points.length - 1].count;
-        const change = last - first;
-        const changeColor = change < 0 ? '#10b981' : (change > 0 ? '#ef4444' : '#64748b');
-        const changeText = change > 0 ? `+${change}` : `${change}`;
-
-        const sampled = points;
-        const startDate = parseDateKey(points[0].date);
-        const endDate = parseDateKey(points[points.length - 1].date);
-        const startLabel = `${startDate.getMonth() + 1}/${startDate.getDate()}`;
-        const endLabel = `${endDate.getMonth() + 1}/${endDate.getDate()}`;
-
-        const chartPixelWidth = Math.max(sampled.length * 6, 240);
-        let bars = `<table cellpadding="0" cellspacing="1" border="0" width="${chartPixelWidth}" style="border-collapse: separate;"><tr>`;
-        for (const point of sampled) {
-            const barHeight = Math.max(Math.round((point.count / maxVal) * maxHeight), 2);
-            const spacerHeight = maxHeight - barHeight;
-            bars += `<td width="6" valign="bottom" style="padding: 0;">
-                <table cellpadding="0" cellspacing="0" border="0" width="6">
-                    ${spacerHeight > 0 ? `<tr><td height="${spacerHeight}" style="font-size:1px; line-height:1px;">&nbsp;</td></tr>` : ''}
-                    <tr><td height="${barHeight}" bgcolor="${color}" style="font-size:1px; line-height:1px;">&nbsp;</td></tr>
-                </table>
-            </td>`;
-        }
-        bars += '</tr></table>';
-
-        const rowBg = index % 2 === 1 ? ' bgcolor="#f8fafc"' : '';
-        rows += `<tr${rowBg} style="border-bottom: 1px solid #e2e8f0;">
-            <td style="padding: 8px; font-size: 11px; font-weight: bold; color: #334155; vertical-align: middle; min-width: 80px; word-break: break-word;">
-                <table cellpadding="0" cellspacing="0" border="0"><tr>
-                    <td width="10" height="10" bgcolor="${color}" style="font-size:1px;">&nbsp;</td>
-                    <td style="padding-left: 6px; font-size: 11px; font-weight: bold; color: #334155;">${escapeHtml(board.name)}</td>
-                </tr></table>
-            </td>
-            <td align="center" style="padding: 8px 6px; vertical-align: middle; white-space: nowrap;">
-                <span style="font-size: 16px; font-weight: bold; color: ${changeColor};">${last}</span>
-                <br><span style="font-size: 9px; color: #94a3b8;">NOW</span>
-            </td>
-            <td style="padding: 8px; vertical-align: middle;">
-                <table width="100%" cellpadding="0" cellspacing="0" border="0" style="margin-bottom: 2px;">
-                    <tr>
-                        <td style="font-size: 9px; color: #94a3b8;">Peak: <strong style="color: #64748b;">${maxVal}</strong></td>
-                        <td align="right" style="font-size: 9px; color: #94a3b8;">Low: <strong style="color: #64748b;">${minVal}</strong></td>
-                    </tr>
-                </table>
-                ${bars}
-                <table width="100%" cellpadding="0" cellspacing="0" border="0" style="margin-top: 2px;">
-                    <tr>
-                        <td style="font-size: 9px; color: #94a3b8;">${startLabel} (${first} open)</td>
-                        <td align="right" style="font-size: 9px; color: #94a3b8;">${endLabel} (${last} open)</td>
-                    </tr>
-                </table>
-            </td>
-            <td align="center" style="padding: 8px 6px; vertical-align: middle; white-space: nowrap;">
-                <span style="font-size: 14px; font-weight: bold; color: ${changeColor};">${changeText}</span>
-                <br><span style="font-size: 9px; color: #94a3b8;">NET</span>
-            </td>
-        </tr>`;
-    });
-
-    return rows;
-}
-
-function generateOutlookTrendFallbackHTML(points, closedCountsByDate = {}) {
-    if (!points || points.length < 3) {
+    if (totalClosed === 0) {
         return `
         <div style="border: 1px solid #e2e8f0; border-radius: 8px; padding: 18px; color: #64748b; font-size: 13px; background-color: #f8fafc;">
-            Not enough board history yet to render the Outlook fallback trend table.
+            No items with a Review/Closure Date in the last ${lookbackDays} days.
         </div>`;
     }
 
-    const recentPoints = points.slice(-10);
-    const peak = Math.max(...recentPoints.map(point => point.count));
-    const low = Math.min(...recentPoints.map(point => point.count));
-    const first = recentPoints[0].count;
-    const last = recentPoints[recentPoints.length - 1].count;
-    const net = last - first;
-    const netColor = net < 0 ? '#10b981' : (net > 0 ? '#ef4444' : '#64748b');
-    const netLabel = net > 0 ? `+${net}` : `${net}`;
-
-    const rows = recentPoints.map((point, index) => {
-        const prev = index > 0 ? recentPoints[index - 1].count : null;
-        const delta = prev === null ? null : point.count - prev;
-        const deltaColor = delta === null ? '#94a3b8' : (delta < 0 ? '#10b981' : (delta > 0 ? '#ef4444' : '#64748b'));
-        const deltaLabel = delta === null ? '--' : (delta > 0 ? `+${delta}` : `${delta}`);
-        const closedCount = closedCountsByDate[point.date] || 0;
+    const recentDays = dateCounts.slice(-10);
+    const maxBarPixels = 200;
+    const rows = recentDays.map((entry, index) => {
         const rowBg = index % 2 === 1 ? '#f8fafc' : '#ffffff';
-
+        const countColor = entry.count > 0 ? '#2563eb' : '#94a3b8';
+        const barPixels = peakDay.count > 0 ? Math.max(Math.round((entry.count / peakDay.count) * maxBarPixels), 0) : 0;
+        const spacerPixels = maxBarPixels - barPixels;
+        const barCell = entry.count > 0
+            ? `<table cellpadding="0" cellspacing="0" border="0" width="${maxBarPixels}"><tr>
+                    <td width="${barPixels}" height="14" bgcolor="#3b82f6" style="font-size: 1px; line-height: 1px;">&nbsp;</td>
+                    ${spacerPixels > 0 ? `<td width="${spacerPixels}" style="font-size: 1px; line-height: 1px;">&nbsp;</td>` : ''}
+               </tr></table>`
+            : '';
         return `
             <tr style="background-color: ${rowBg};">
-                <td style="padding: 10px 12px; border-top: 1px solid #e2e8f0; font-size: 12px; color: #0f172a; font-weight: 600;">${escapeHtml(formatDate(parseDateKey(point.date)))}</td>
-                <td align="center" style="padding: 10px 12px; border-top: 1px solid #e2e8f0; font-size: 13px; color: #0f172a; font-weight: 800;">${point.count}</td>
-                <td align="center" style="padding: 10px 12px; border-top: 1px solid #e2e8f0; font-size: 13px; color: #2563eb; font-weight: 800;">${closedCount}</td>
-                <td align="center" style="padding: 10px 12px; border-top: 1px solid #e2e8f0; font-size: 13px; color: ${deltaColor}; font-weight: 800;">${deltaLabel}</td>
+                <td style="padding: 10px 12px; border-top: 1px solid #e2e8f0; font-size: 12px; color: #0f172a; font-weight: 600;">${escapeHtml(formatDate(parseDateKey(entry.date)))}</td>
+                <td align="center" style="padding: 10px 12px; border-top: 1px solid #e2e8f0; font-size: 13px; color: ${countColor}; font-weight: 800;">${entry.count}</td>
+                <td style="padding: 10px 12px; border-top: 1px solid #e2e8f0;">${barCell}</td>
             </tr>`;
     }).join('');
 
     return `
     <table width="100%" cellpadding="0" cellspacing="0" border="0" style="border: 1px solid #cbd5e1; border-collapse: collapse; border-radius: 8px; overflow: hidden; background-color: #ffffff;">
         <tr style="background-color: #0f172a; color: #ffffff;">
-            <td colspan="4" style="padding: 12px 14px;">
+            <td colspan="3" style="padding: 12px 14px;">
                 <table width="100%" cellpadding="0" cellspacing="0" border="0">
                     <tr>
-                        <td style="font-size: 14px; font-weight: 800; letter-spacing: 0.5px; text-transform: uppercase;">Outlook Trend Snapshot</td>
+                        <td style="font-size: 14px; font-weight: 800; letter-spacing: 0.5px; text-transform: uppercase;">Closed Items by Date</td>
                         <td align="right" style="font-size: 12px; font-weight: 600;">Last 10 calendar days</td>
                     </tr>
                 </table>
@@ -894,27 +785,22 @@ function generateOutlookTrendFallbackHTML(points, closedCountsByDate = {}) {
         </tr>
         <tr style="background-color: #eff6ff;">
             <td style="padding: 12px 14px; border-top: 1px solid #cbd5e1;">
-                <div style="font-size: 10px; font-weight: 800; color: #64748b; text-transform: uppercase; letter-spacing: 0.6px; margin-bottom: 4px;">Peak</div>
-                <div style="font-size: 24px; font-weight: 900; color: #1d4ed8;">${peak}</div>
+                <div style="font-size: 10px; font-weight: 800; color: #64748b; text-transform: uppercase; letter-spacing: 0.6px; margin-bottom: 4px;">Total (${lookbackDays}D)</div>
+                <div style="font-size: 24px; font-weight: 900; color: #2563eb;">${totalClosed}</div>
             </td>
             <td style="padding: 12px 14px; border-top: 1px solid #cbd5e1; border-left: 1px solid #cbd5e1;">
-                <div style="font-size: 10px; font-weight: 800; color: #64748b; text-transform: uppercase; letter-spacing: 0.6px; margin-bottom: 4px;">Low</div>
-                <div style="font-size: 24px; font-weight: 900; color: #0f172a;">${low}</div>
+                <div style="font-size: 10px; font-weight: 800; color: #64748b; text-transform: uppercase; letter-spacing: 0.6px; margin-bottom: 4px;">Avg / Day</div>
+                <div style="font-size: 24px; font-weight: 900; color: #0f172a;">${avgPerDay}</div>
             </td>
             <td style="padding: 12px 14px; border-top: 1px solid #cbd5e1; border-left: 1px solid #cbd5e1;">
-                <div style="font-size: 10px; font-weight: 800; color: #64748b; text-transform: uppercase; letter-spacing: 0.6px; margin-bottom: 4px;">Closed</div>
-                <div style="font-size: 24px; font-weight: 900; color: #2563eb;">${recentPoints.reduce((sum, point) => sum + (closedCountsByDate[point.date] || 0), 0)}</div>
-            </td>
-            <td style="padding: 12px 14px; border-top: 1px solid #cbd5e1; border-left: 1px solid #cbd5e1;">
-                <div style="font-size: 10px; font-weight: 800; color: #64748b; text-transform: uppercase; letter-spacing: 0.6px; margin-bottom: 4px;">Net</div>
-                <div style="font-size: 24px; font-weight: 900; color: ${netColor};">${netLabel}</div>
+                <div style="font-size: 10px; font-weight: 800; color: #64748b; text-transform: uppercase; letter-spacing: 0.6px; margin-bottom: 4px;">Days w/ Closures</div>
+                <div style="font-size: 24px; font-weight: 900; color: #10b981;">${daysWithClosures} <span style="font-size: 12px; color: #94a3b8;">/ ${lookbackDays}</span></div>
             </td>
         </tr>
         <tr style="background-color: #f8fafc;">
             <th align="left" style="padding: 10px 12px; border-top: 1px solid #e2e8f0; font-size: 11px; color: #475569; text-transform: uppercase; letter-spacing: 0.5px;">Date</th>
-            <th align="center" style="padding: 10px 12px; border-top: 1px solid #e2e8f0; font-size: 11px; color: #475569; text-transform: uppercase; letter-spacing: 0.5px;">Open</th>
             <th align="center" style="padding: 10px 12px; border-top: 1px solid #e2e8f0; font-size: 11px; color: #475569; text-transform: uppercase; letter-spacing: 0.5px;">Closed</th>
-            <th align="center" style="padding: 10px 12px; border-top: 1px solid #e2e8f0; font-size: 11px; color: #475569; text-transform: uppercase; letter-spacing: 0.5px;">Delta</th>
+            <th align="left" style="padding: 10px 12px; border-top: 1px solid #e2e8f0; font-size: 11px; color: #475569; text-transform: uppercase; letter-spacing: 0.5px;"></th>
         </tr>
         ${rows}
     </table>`;
@@ -941,10 +827,6 @@ function generateCSV(board, boardStats, recentClosedItems) {
     lines.push('BOARD ACTIVITY SUMMARY');
     lines.push('Metric,1D,2D,3D,4D,5D');
     lines.push([
-        csvValue('Net'),
-        ...boardStats.activityWindows.map(window => csvValue(window.netChange === null ? '--' : `${window.netChange > 0 ? '+' : ''}${window.netChange}`))
-    ].join(','));
-    lines.push([
         csvValue('Closed'),
         ...boardStats.activityWindows.map(window => window.closedCount)
     ].join(','));
@@ -969,45 +851,18 @@ function generateCSV(board, boardStats, recentClosedItems) {
     return lines.join('\n');
 }
 
-function generateEmailHTML(workspaceName, board, boardStats, recentClosedItems, historyStore, closedCountsByDate) {
+function generateEmailHTML(workspaceName, board, boardStats, recentClosedItems, closedCountsByDate) {
     const today = new Date().toLocaleDateString('en-US', {
         weekday: 'long',
         year: 'numeric',
         month: 'long',
         day: 'numeric'
     });
-    const boardStatsList = [boardStats];
-    const chartData = prepareChartData(historyStore || {}, boardStatsList);
-    const detailChartRows = generateDetailChartHTML(chartData, boardStatsList);
-    const trendPoints = chartData[board.id] || [];
-    const outlookTrendFallback = generateOutlookTrendFallbackHTML(trendPoints, closedCountsByDate);
-    const trendRangeText = trendPoints.length > 0
-        ? `${formatDate(parseDateKey(trendPoints[0].date))} to ${formatDate(parseDateKey(trendPoints[trendPoints.length - 1].date))}`
-        : '';
+    const closedByDateHTML = generateClosedByDateHTML(closedCountsByDate, 30);
 
     const getChangeColor = value => value > 0 ? '#dc2626' : (value < 0 ? '#10b981' : '#64748b');
-    const getTrendArrow = trend => {
-        if (trend === 'improving') return '<span style="color: #10b981; font-size: 24px; font-weight: bold;">&#9660;</span>';
-        if (trend === 'declining') return '<span style="color: #f43f5e; font-size: 24px; font-weight: bold;">&#9650;</span>';
-        return '<span style="color: #64748b; font-size: 20px; font-weight: bold;">&#9654;</span>';
-    };
-    const formatSignedMetric = value => value === null || value === undefined
-        ? '--'
-        : `${value > 0 ? '+' : ''}${value}`;
     const activityHeaderCells = boardStats.activityWindows.map(window => `
                                     <th style="padding: 14px 10px; text-align: center; font-size: 14px; font-weight: 800; letter-spacing: 0.5px;">${window.days}D</th>`).join('');
-    const activityNetCells = boardStats.activityWindows.map(window => {
-        const color = window.netChange === null || window.netChange === undefined
-            ? '#94a3b8'
-            : getChangeColor(window.netChange);
-        const background = window.netChange === null || window.netChange === undefined
-            ? '#f8fafc'
-            : (window.netChange > 0 ? '#fff1f2' : (window.netChange < 0 ? '#ecfdf5' : '#f8fafc'));
-        return `
-                                    <td align="center" style="padding: 18px 10px; background-color: ${background}; border-left: 1px solid #e2e8f0;">
-                                        <div style="font-size: 28px; font-weight: 900; color: ${color}; line-height: 1;">${formatSignedMetric(window.netChange)}</div>
-                                    </td>`;
-    }).join('');
     const activityClosedCells = boardStats.activityWindows.map(window => `
                                     <td align="center" style="padding: 18px 10px; background-color: #eff6ff; border-left: 1px solid #e2e8f0;">
                                         <div style="font-size: 28px; font-weight: 900; color: #2563eb; line-height: 1;">${window.closedCount}</div>
@@ -1178,16 +1033,12 @@ function generateEmailHTML(workspaceName, board, boardStats, recentClosedItems, 
                                 </tr>
                             </table>
                             <p style="font-size: 12px; color: #64748b; margin: 0 0 16px 0; line-height: 1.6;">
-                                Net compares today&apos;s open count to the closest stored snapshot from 1 to 5 calendar days ago. Closed shows how many items moved into a closed status over the same lookback windows.
+                                Closed shows how many items moved into a closed status over each lookback window (1 to 5 calendar days).
                             </p>
                             <table width="100%" cellpadding="0" cellspacing="0" style="border: 2px solid #cbd5e1; border-collapse: collapse; border-radius: 12px; overflow: hidden; background-color: #ffffff;">
                                 <tr style="background-color: #0f172a; color: #ffffff;">
                                     <th align="left" style="padding: 16px 14px; min-width: 170px; font-size: 13px; font-weight: 800; text-transform: uppercase; letter-spacing: 0.7px;">Metric</th>
                                     ${activityHeaderCells}
-                                </tr>
-                                <tr style="border-top: 1px solid #e2e8f0;">
-                                    <td style="padding: 16px 14px; background-color: #f8fafc; font-size: 13px; font-weight: 800; color: #0f172a; text-transform: uppercase; letter-spacing: 0.7px;">Net</td>
-                                    ${activityNetCells}
                                 </tr>
                                 <tr style="border-top: 1px solid #e2e8f0;">
                                     <td style="padding: 16px 14px; background-color: #eff6ff; font-size: 13px; font-weight: 800; color: #1d4ed8; text-transform: uppercase; letter-spacing: 0.7px;">Closed</td>
@@ -1196,17 +1047,13 @@ function generateEmailHTML(workspaceName, board, boardStats, recentClosedItems, 
                             </table>
                             <table width="100%" cellpadding="0" cellspacing="10" border="0" style="margin-top: 14px;">
                                 <tr>
-                                    <td width="33.33%" style="background: #ffffff; border: 1px solid #dbeafe; border-radius: 10px; padding: 14px 16px;">
+                                    <td width="50%" style="background: #ffffff; border: 1px solid #dbeafe; border-radius: 10px; padding: 14px 16px;">
                                         <div style="font-size: 11px; font-weight: 800; color: #64748b; text-transform: uppercase; letter-spacing: 0.6px; margin-bottom: 4px;">Current Open</div>
                                         <div style="font-size: 28px; font-weight: 900; color: #0f172a;">${boardStats.openItems}</div>
                                     </td>
-                                    <td width="33.33%" style="background: #ffffff; border: 1px solid #dbeafe; border-radius: 10px; padding: 14px 16px;">
-                                        <div style="font-size: 11px; font-weight: 800; color: #64748b; text-transform: uppercase; letter-spacing: 0.6px; margin-bottom: 4px;">Overall Trend</div>
-                                        <div style="font-size: 24px; font-weight: 900; color: #0f172a;">${getTrendArrow(boardStats.trend)} <span style="vertical-align: middle; font-size: 24px; color: ${getChangeColor(boardStats.change)};">${formatSignedMetric(boardStats.change)}</span></div>
-                                    </td>
-                                    <td width="33.33%" style="background: #ffffff; border: 1px solid #dbeafe; border-radius: 10px; padding: 14px 16px;">
-                                        <div style="font-size: 11px; font-weight: 800; color: #64748b; text-transform: uppercase; letter-spacing: 0.6px; margin-bottom: 4px;">Open Trend (30D)</div>
-                                        <div style="padding-top: 3px;">${generateSparklineHTML(chartData[board.id], 30)}</div>
+                                    <td width="50%" style="background: #ffffff; border: 1px solid #dbeafe; border-radius: 10px; padding: 14px 16px;">
+                                        <div style="font-size: 11px; font-weight: 800; color: #64748b; text-transform: uppercase; letter-spacing: 0.6px; margin-bottom: 4px;">Closed (30D)</div>
+                                        <div style="font-size: 28px; font-weight: 900; color: #2563eb;">${Object.entries(closedCountsByDate).filter(([date]) => parseDateKey(date) >= new Date(new Date().setDate(new Date().getDate() - 30))).reduce((sum, [, count]) => sum + count, 0)}</div>
                                     </td>
                                 </tr>
                             </table>
@@ -1218,34 +1065,12 @@ function generateEmailHTML(workspaceName, board, boardStats, recentClosedItems, 
                             <table cellpadding="0" cellspacing="0" border="0" width="100%" style="margin-bottom: 12px;">
                                 <tr>
                                     <td style="font-size: 24px; color: #3b82f6; vertical-align: middle;">&#128200;</td>
-                                    <td style="font-size: 15px; font-weight: bold; color: #1e293b; text-transform: uppercase; letter-spacing: 1.5px; padding-left: 10px; vertical-align: middle;">Open Item Trends</td>
+                                    <td style="font-size: 15px; font-weight: bold; color: #1e293b; text-transform: uppercase; letter-spacing: 1.5px; padding-left: 10px; vertical-align: middle;">Closed Items by Date</td>
                                     <td style="width: 100%; padding-left: 15px; vertical-align: middle;"><div style="height: 2px; background: linear-gradient(90deg, #e2e8f0 0%, transparent 100%); background-color: #e2e8f0;"></div></td>
                                 </tr>
                             </table>
-                            <p style="font-size: 11px; color: #64748b; margin: 0 0 12px 0;">${trendPoints.length > 0 ? `Showing ${trendPoints.length} calendar-day bars from ${escapeHtml(trendRangeText)}. Each bar represents one day of open-item history; when a day had no stored snapshot, the prior day's open count is carried forward.` : 'Each bar represents one day of open-item history for the PDX board.'}</p>
-                            <div style="font-size: 11px; color: #64748b; margin: 0 0 12px 0;">Trend Snapshot is shown for all email clients. The detailed graph remains below as supplemental context for web, mobile, and non-Outlook clients.</div>
-                            ${outlookTrendFallback}
-                            <div style="height: 14px; line-height: 14px; font-size: 1px;">&nbsp;</div>
-                            <!--[if mso]>
-                            <div style="border: 1px solid #e2e8f0; border-radius: 8px; padding: 16px; color: #64748b; font-size: 13px; background-color: #f8fafc;">
-                                Outlook desktop is using the Trend Snapshot above instead of the detailed Daily Open Item Count graph for more reliable rendering.
-                            </div>
-                            <![endif]-->
-                            <!--[if !mso]><!-->
-                            ${detailChartRows ? `
-                            <table width="100%" cellpadding="0" cellspacing="0" border="0" style="border: 1px solid #e2e8f0; border-collapse: collapse; border-radius: 8px; overflow: hidden;">
-                                <tr style="background-color: #0f172a; color: #ffffff; font-size: 10px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px;">
-                                    <th align="left" style="padding: 10px 8px; min-width: 80px;">Board</th>
-                                    <th style="padding: 10px 6px; text-align: center;">Now</th>
-                                    <th style="padding: 10px 8px; text-align: center; min-width: 520px;">Daily Open Item Count</th>
-                                    <th style="padding: 10px 6px; text-align: center;">Net</th>
-                                </tr>
-                                ${detailChartRows}
-                            </table>` : `
-                            <div style="border: 1px solid #e2e8f0; border-radius: 8px; padding: 18px; color: #64748b; font-size: 13px; background-color: #f8fafc;">
-                                Not enough board history yet to render the detailed trend chart. The report will start populating this section once at least three daily snapshots exist.
-                            </div>`}
-                            <!--<![endif]-->
+                            <p style="font-size: 11px; color: #64748b; margin: 0 0 12px 0;">Closure counts are based on the Review/Closure Date column. Each row shows how many items were closed on that date.</p>
+                            ${closedByDateHTML}
                         </td>
                     </tr>
 
@@ -1340,30 +1165,6 @@ function renderAgingTable(title, headerColor, headingBg, headingTextColor, items
     </table>`;
 }
 
-function expandToDailyPoints(snapshotPoints) {
-    if (!snapshotPoints || snapshotPoints.length === 0) {
-        return [];
-    }
-
-    const sorted = [...snapshotPoints].sort((a, b) => a.date.localeCompare(b.date));
-    const countsByDate = new Map(sorted.map(point => [point.date, point.count]));
-    const expanded = [];
-
-    let cursor = parseDateKey(sorted[0].date);
-    const end = parseDateKey(sorted[sorted.length - 1].date);
-    let lastKnownCount = sorted[0].count;
-
-    while (cursor && end && cursor <= end) {
-        const dateKey = formatDateKey(cursor);
-        if (countsByDate.has(dateKey)) {
-            lastKnownCount = countsByDate.get(dateKey);
-        }
-        expanded.push({ date: dateKey, count: lastKnownCount });
-        cursor.setDate(cursor.getDate() + 1);
-    }
-
-    return expanded;
-}
 
 function parseDateKey(dateText) {
     const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(dateText || '');
