@@ -316,8 +316,8 @@ function summarizeBoard(board, boardItems, comparisonData, historyStore, todayKe
 
     const closedRecently = boardItems.filter(item =>
         config.CLOSED_STATUSES.includes(item.status) &&
-        item.recentClosedAt &&
-        item.recentClosedAt >= getDaysAgo(config.COMPARISON_DAYS)
+        item.reviewClosedAt &&
+        item.reviewClosedAt >= getDaysAgo(config.COMPARISON_DAYS)
     ).length;
 
     const newLast5 = boardItems.filter(item => new Date(item.created_at) >= getDaysAgo(5)).length;
@@ -354,8 +354,8 @@ function summarizeBoard(board, boardItems, comparisonData, historyStore, todayKe
         const netChange = priorOpenCount !== undefined ? openCount - priorOpenCount : null;
         const closedCount = boardItems.filter(item =>
             config.CLOSED_STATUSES.includes(item.status) &&
-            item.recentClosedAt &&
-            item.recentClosedAt >= getDaysAgo(days)
+            item.reviewClosedAt &&
+            item.reviewClosedAt >= getDaysAgo(days)
         ).length;
 
         return {
@@ -860,7 +860,6 @@ function generateEmailHTML(workspaceName, board, boardStats, recentClosedItems, 
     });
     const closedByDateHTML = generateClosedByDateHTML(closedCountsByDate, 30);
 
-    const getChangeColor = value => value > 0 ? '#dc2626' : (value < 0 ? '#10b981' : '#64748b');
     const activityHeaderCells = boardStats.activityWindows.map(window => `
                                     <th style="padding: 14px 10px; text-align: center; font-size: 14px; font-weight: 800; letter-spacing: 0.5px;">${window.days}D</th>`).join('');
     const activityClosedCells = boardStats.activityWindows.map(window => `
@@ -995,25 +994,15 @@ function generateEmailHTML(workspaceName, board, boardStats, recentClosedItems, 
                                     <td>
                                         <table width="100%" cellpadding="0" cellspacing="8" border="0">
                                             <tr>
-                                                <td width="25%" style="background: #ffffff; border: 1px solid #e2e8f0; border-left: 4px solid #f43f5e; border-radius: 8px; padding: 12px; position: relative;">
+                                                <td width="50%" style="background: #ffffff; border: 1px solid #e2e8f0; border-left: 4px solid #f43f5e; border-radius: 8px; padding: 12px; position: relative;">
                                                     <div style="font-size: 9px; font-weight: bold; color: #94a3b8; text-transform: uppercase;">Total Open</div>
                                                     <div style="font-size: 24px; font-weight: bold; color: #e11d48;">${boardStats.openItems}</div>
                                                     <div style="position: absolute; top: 5px; right: 8px; font-size: 32px; color: #fda4af;">&#128194;</div>
                                                 </td>
-                                                <td width="25%" style="background: #ffffff; border: 1px solid #e2e8f0; border-left: 4px solid #3b82f6; border-radius: 8px; padding: 12px; position: relative;">
+                                                <td width="50%" style="background: #ffffff; border: 1px solid #e2e8f0; border-left: 4px solid #3b82f6; border-radius: 8px; padding: 12px; position: relative;">
                                                     <div style="font-size: 9px; font-weight: bold; color: #94a3b8; text-transform: uppercase;">Closed (${config.COMPARISON_DAYS}D)</div>
                                                     <div style="font-size: 24px; font-weight: bold; color: #2563eb;">${boardStats.closedRecently}</div>
                                                     <div style="position: absolute; top: 5px; right: 8px; font-size: 32px; color: #93c5fd;">&#9989;</div>
-                                                </td>
-                                                <td width="25%" style="background: #ffffff; border: 1px solid #e2e8f0; border-left: 4px solid ${getChangeColor(boardStats.change)}; border-radius: 8px; padding: 12px; position: relative;">
-                                                    <div style="font-size: 9px; font-weight: bold; color: #94a3b8; text-transform: uppercase;">Net Change (${config.COMPARISON_DAYS}D)</div>
-                                                    <div style="font-size: 24px; font-weight: bold; color: ${getChangeColor(boardStats.change)};">${boardStats.change > 0 ? '+' : ''}${boardStats.change}</div>
-                                                    <div style="position: absolute; top: 5px; right: 8px; font-size: 32px; color: ${boardStats.change <= 0 ? '#6ee7b7' : '#fca5a5'};">&#8596;</div>
-                                                </td>
-                                                <td width="25%" style="background: #ffffff; border: 1px solid #e2e8f0; border-left: 4px solid #8b5cf6; border-radius: 8px; padding: 12px; position: relative;">
-                                                    <div style="font-size: 9px; font-weight: bold; color: #94a3b8; text-transform: uppercase;">Total Items</div>
-                                                    <div style="font-size: 24px; font-weight: bold; color: #7c3aed;">${boardStats.totalItems}</div>
-                                                    <div style="position: absolute; top: 5px; right: 8px; font-size: 32px; color: #c4b5fd;">&#128202;</div>
                                                 </td>
                                             </tr>
                                         </table>
