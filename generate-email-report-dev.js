@@ -200,16 +200,12 @@ async function generateReport() {
                     currentRunCounts[board.id] = openCount;
 
                     // Count closed items across 5D, 10D, 30D periods
+                    // Use DATE_CLOSED column as authoritative closure date
                     const countClosed = (days) => boardItems.filter(i => {
                         if (!config.CLOSED_STATUSES.includes(i.status)) return false;
-                        if (i.statusValue) {
-                            try {
-                                const sv = JSON.parse(i.statusValue);
-                                if (sv.changed_at) return new Date(sv.changed_at) >= getDaysAgo(days);
-                            } catch (e) {}
-                        }
                         if (!i.dateClosed) return false;
-                        return new Date(i.dateClosed) >= getDaysAgo(days);
+                        const closedDate = new Date(i.dateClosed);
+                        return !isNaN(closedDate.getTime()) && closedDate >= getDaysAgo(days);
                     }).length;
 
                     const closedLast5 = countClosed(5);
