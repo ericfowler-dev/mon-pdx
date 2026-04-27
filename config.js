@@ -20,8 +20,8 @@ module.exports = {
     // Statuses considered "closed" for throughput tracking (expanded per user feedback)
     CLOSED_STATUSES: ['Complete', 'Completed', 'Closed', 'Done', 'Resolved', 'Review Status', 'Pending', 'Cancelled', 'Non-Issue', 'CAR Pending', 'CX Alloy Update', 'CxA (Iconicx) Pending Verification', 'Review', 'Pending Job', 'Stack Verification'],
 
-    // Comparison period in days (default 7)
-    COMPARISON_DAYS: 7,
+    // Comparison period in days (aligned with velocity metrics)
+    COMPARISON_DAYS: 5,
 
     // Health score targets (used for weighted calculation)
     // OPEN_TARGET: Expected "healthy" backlog size per board. Lower = stricter scoring.

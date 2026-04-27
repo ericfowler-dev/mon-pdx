@@ -1,0 +1,25 @@
+services:
+  - type: cron
+    name: enclosure-support-email-cron
+    runtime: node
+    plan: starter
+    schedule: '0 5 * * 2-6'
+    buildCommand: npm ci
+    startCommand: node generate-email-report-dev.js --force
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: FORCE_RUN
+        value: '1'
+      - key: MONDAY_API_TOKEN
+        sync: false
+      - key: REPORT_TO_EMAIL
+        sync: false
+      - key: M365_TENANT_ID
+        sync: false
+      - key: M365_CLIENT_ID
+        sync: false
+      - key: M365_CLIENT_SECRET
+        sync: false
+      - key: M365_SENDER_UPN
+        sync: false
