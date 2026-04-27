@@ -7,7 +7,6 @@ const os = require('os');
 const config = require('./pdx-daily-report.config');
 
 const client = new ApiClient(process.env.MONDAY_API_TOKEN);
-const SHARED_HISTORY_FILE = path.join(__dirname, 'history.json');
 const HISTORY_FILE = path.join(__dirname, 'history-pdx-daily.json');
 const HISTORY_SEED_FILE = path.join(__dirname, 'pdx-history-seed.json');
 const LAST_RUN_FILE = path.join(__dirname, 'last_run_pdx_daily.txt');
@@ -55,9 +54,8 @@ async function generateReport() {
             fetchTargetBoard()
         ]);
 
-        const sharedHistory = readHistoryFile(SHARED_HISTORY_FILE);
         const pdxHistory = await runtimeStore.readPdxHistory();
-        const historyForBoard = mergeBoardHistory(sharedHistory, pdxHistory, board.id);
+        const historyForBoard = pdxHistory;
         const comparison = resolveComparisonSnapshot(historyForBoard, todayKey, config.COMPARISON_DAYS);
 
         const boardItems = await fetchBoardItems(board);
@@ -538,26 +536,6 @@ function mergeDateStores(primaryStore, secondaryStore) {
             ...(primaryStore?.[date] || {}),
             ...(secondaryStore?.[date] || {})
         };
-    });
-
-    return merged;
-}
-
-function mergeBoardHistory(sharedHistory, localHistory, boardId) {
-    const merged = {};
-    const allDates = new Set([
-        ...Object.keys(sharedHistory || {}),
-        ...Object.keys(localHistory || {})
-    ]);
-
-    [...allDates].sort().forEach(date => {
-        const sharedValue = sharedHistory?.[date]?.[boardId];
-        const localValue = localHistory?.[date]?.[boardId];
-        if (sharedValue !== undefined || localValue !== undefined) {
-            merged[date] = {
-                [boardId]: localValue !== undefined ? localValue : sharedValue
-            };
-        }
     });
 
     return merged;
