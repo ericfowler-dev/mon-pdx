@@ -3,7 +3,9 @@ services:
     name: enclosure-support-email-cron
     runtime: node
     plan: starter
-    schedule: '0 5 * * 2-6'
+    # 04:00 UTC daily = 10:00 PM CST (winter) / 11:00 PM CDT (summer).
+    # Fires every day of the week.
+    schedule: '0 4 * * *'
     buildCommand: npm ci
     startCommand: node generate-email-report-dev.js --force
     envVars:
@@ -22,4 +24,6 @@ services:
       - key: M365_CLIENT_SECRET
         sync: false
       - key: M365_SENDER_UPN
+        sync: false
+      - key: REDIS_URL
         sync: false

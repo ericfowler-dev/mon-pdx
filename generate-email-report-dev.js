@@ -1,5 +1,6 @@
 require('dotenv').config();
 const { ApiClient } = require('@mondaydotcomorg/api');
+const { createClient } = require('redis');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
@@ -7,60 +8,43 @@ const config = require('./config');
 
 const client = new ApiClient(process.env.MONDAY_API_TOKEN);
 const HISTORY_FILE = path.join(__dirname, 'history.json');
+const HISTORY_SEED_FILE = path.join(__dirname, 'enclosure-history-seed.json');
 const LAST_RUN_FILE = path.join(__dirname, 'last_run.txt');
+const REDIS_HISTORY_KEY = process.env.ENCLOSURE_REDIS_HISTORY_KEY || 'enclosure:history';
+const REDIS_LAST_RUN_KEY = process.env.ENCLOSURE_REDIS_LAST_RUN_KEY || 'enclosure:last_run';
 
 async function generateReport() {
+    let runtimeStore;
     try {
+        runtimeStore = await createRuntimeStore();
+
         // Force flag allows manual runs outside schedule or repeat runs the same day
         const forceRun = process.argv.some(arg => arg === '--force' || arg === '-f') || process.env.FORCE_RUN === '1';
 
-        // Check if already run today and if it's around 1pm CST (19:00 UTC)
         const now = new Date();
-        const utcHour = now.getUTCHours();
         const todayKey = now.toISOString().split('T')[0];
 
-        // 1pm CST = 19:00 UTC
-        const isScheduledTime = utcHour === 19;
-
         if (forceRun) {
-            console.log('⚡ Force mode enabled; bypassing schedule/duplicate safeguards.');
+            console.log('⚡ Force mode enabled; bypassing duplicate-run safeguard.');
         }
 
-        if (fs.existsSync(LAST_RUN_FILE)) {
-            const lastRun = fs.readFileSync(LAST_RUN_FILE, 'utf8').trim();
-            if (lastRun === todayKey && !forceRun) {
-                console.log('📧 Report already generated today. Skipping.');
-                return;
-            } else if (lastRun === todayKey && forceRun) {
-                console.log('⚡ Force mode: rerunning even though today\'s report already exists.');
-            }
-        }
-
-        if (!isScheduledTime && !forceRun) {
-            console.log(`📧 Not scheduled time (1pm CST / 19:00 UTC). Current UTC hour: ${utcHour}. Skipping.`);
+        const lastRun = await runtimeStore.readLastRun();
+        if (lastRun === todayKey && !forceRun) {
+            console.log('📧 Report already generated today. Skipping.');
             return;
-        } else if (!isScheduledTime && forceRun) {
-            console.log(`⚡ Force mode: running outside scheduled window (UTC hour: ${utcHour}).`);
+        } else if (lastRun === todayKey && forceRun) {
+            console.log('⚡ Force mode: rerunning even though today\'s report already exists.');
         }
 
         console.log('📧 Gathering Enclosure Support Data...\n');
 
-        const todayKey2 = new Date().toISOString().split('T')[0];
-        let historyStore = {};
-
-        if (fs.existsSync(HISTORY_FILE)) {
-            try {
-                historyStore = JSON.parse(fs.readFileSync(HISTORY_FILE, 'utf8'));
-            } catch (err) {
-                console.error('   ⚠️ Error reading history file:', err.message);
-            }
-        }
+        let historyStore = await runtimeStore.readHistory();
 
         // Calculate comparison date based on config
         // Find data from ~COMPARISON_DAYS ago (closest available date within ±2 days)
         const targetDate = new Date();
         targetDate.setDate(targetDate.getDate() - config.COMPARISON_DAYS);
-        const targetDateKey = targetDate.toISOString().split('T')[0];
+        const targetDateKey = formatDateKey(targetDate);
 
         let comparisonData = historyStore[targetDateKey];
         let comparisonDateUsed = targetDateKey;
@@ -73,10 +57,10 @@ async function generateReport() {
                 // Find closest date to target
                 const targetTime = targetDate.getTime();
                 let closestDate = sortedDates[0];
-                let closestDiff = Math.abs(new Date(closestDate).getTime() - targetTime);
+                let closestDiff = Math.abs(parseDateKey(closestDate).getTime() - targetTime);
 
                 for (const dateKey of sortedDates) {
-                    const diff = Math.abs(new Date(dateKey).getTime() - targetTime);
+                    const diff = Math.abs(parseDateKey(dateKey).getTime() - targetTime);
                     if (diff < closestDiff) {
                         closestDiff = diff;
                         closestDate = dateKey;
@@ -199,13 +183,17 @@ async function generateReport() {
                     const openCount = openItems.length;
                     currentRunCounts[board.id] = openCount;
 
-                    // Count closed items across 5D, 10D, 30D periods
-                    // Use DATE_CLOSED column as authoritative closure date
+                    // Count closed items across 5D, 10D, 30D periods.
+                    // Hybrid date strategy (mirrors PDX):
+                    //   1. Prefer DATE_CLOSED column (manually entered, most precise)
+                    //   2. Fall back to status.changed_at when DATE_CLOSED is empty
+                    // Filter is on CURRENT status, so items currently in CLOSED_STATUSES
+                    // are counted once based on whichever closure-event date is available.
                     const countClosed = (days) => boardItems.filter(i => {
                         if (!config.CLOSED_STATUSES.includes(i.status)) return false;
-                        if (!i.dateClosed) return false;
-                        const closedDate = new Date(i.dateClosed);
-                        return !isNaN(closedDate.getTime()) && closedDate >= getDaysAgo(days);
+                        const fallbackChangedAt = parseStatusChangedAt(i.statusValue);
+                        const closedDate = parseClosedEventAt(i.dateClosed, fallbackChangedAt);
+                        return closedDate && closedDate >= getDaysAgo(days);
                     }).length;
 
                     const closedLast5 = countClosed(5);
@@ -278,14 +266,10 @@ async function generateReport() {
             }
         }));
 
-        // Save history
+        // Save history (Redis-backed when REDIS_URL is set, file fallback otherwise)
         historyStore[todayKey] = currentRunCounts;
-        const retentionDate = new Date();
-        retentionDate.setDate(retentionDate.getDate() - config.HISTORY_RETENTION_DAYS);
-        Object.keys(historyStore).forEach(date => {
-            if (new Date(date) < retentionDate) delete historyStore[date];
-        });
-        fs.writeFileSync(HISTORY_FILE, JSON.stringify(historyStore, null, 2), 'utf8');
+        pruneHistory(historyStore, config.HISTORY_RETENTION_DAYS);
+        await runtimeStore.writeHistory(historyStore);
 
         // Get recent items for detail section
         const tenDaysAgo = new Date();
@@ -313,8 +297,8 @@ async function generateReport() {
         }
         fs.writeFileSync(path.join(exportsPath, csvFileName), csvContent, 'utf8');
 
-        // Mark as run today
-        fs.writeFileSync(LAST_RUN_FILE, todayKey, 'utf8');
+        // Mark as run today (Redis-backed when REDIS_URL is set, file fallback otherwise)
+        await runtimeStore.writeLastRun(todayKey);
 
         console.log(`\n✅ Success! Reports saved:`);
         if (onedrivePath) {
@@ -329,7 +313,189 @@ async function generateReport() {
 
     } catch (err) {
         console.error('❌ Fatal Error:', err.message);
+        if (err.stack) {
+            console.error(err.stack);
+        }
+        process.exitCode = 1;
+    } finally {
+        if (runtimeStore) {
+            await runtimeStore.close();
+        }
     }
+}
+
+// ── Runtime Store (Redis-backed when REDIS_URL is set, file fallback) ────────
+
+async function createRuntimeStore() {
+    if (!process.env.REDIS_URL) {
+        return createFileRuntimeStore();
+    }
+
+    const redisClient = createClient({ url: process.env.REDIS_URL });
+    redisClient.on('error', error => {
+        console.error(`Redis runtime store error: ${error.message}`);
+    });
+
+    await redisClient.connect();
+    console.log(`💾 Using Redis runtime store (keys: ${REDIS_HISTORY_KEY}, ${REDIS_LAST_RUN_KEY}).`);
+
+    return {
+        async readLastRun() {
+            const value = await redisClient.get(REDIS_LAST_RUN_KEY);
+            if (value) {
+                return value.trim();
+            }
+            // Bootstrap from local file if Redis is empty (first run after migration)
+            if (fs.existsSync(LAST_RUN_FILE)) {
+                return fs.readFileSync(LAST_RUN_FILE, 'utf8').trim();
+            }
+            return '';
+        },
+        async writeLastRun(todayKey) {
+            await redisClient.set(REDIS_LAST_RUN_KEY, todayKey);
+        },
+        async readHistory() {
+            const seedHistory = readHistoryFile(HISTORY_SEED_FILE);
+            const value = await redisClient.get(REDIS_HISTORY_KEY);
+            if (value) {
+                try {
+                    const redisHistory = JSON.parse(value);
+                    // Always merge bundled seed in case Redis was missing older entries
+                    return mergeDateStores(seedHistory, redisHistory);
+                } catch (error) {
+                    throw new Error(`Unable to parse Redis history key ${REDIS_HISTORY_KEY}: ${error.message}`);
+                }
+            }
+            // Redis empty: bootstrap from bundled seed + any local history file
+            const fileHistory = readHistoryFile(HISTORY_FILE);
+            const mergedSeed = mergeDateStores(seedHistory, fileHistory);
+            if (Object.keys(mergedSeed).length > 0) {
+                console.log(`💾 Bootstrapping Redis history from bundled seed + local file into ${REDIS_HISTORY_KEY}.`);
+                await redisClient.set(REDIS_HISTORY_KEY, JSON.stringify(mergedSeed));
+            }
+            return mergedSeed;
+        },
+        async writeHistory(historyStore) {
+            await redisClient.set(REDIS_HISTORY_KEY, JSON.stringify(historyStore));
+        },
+        async close() {
+            if (redisClient.isOpen) {
+                await redisClient.quit();
+            }
+        }
+    };
+}
+
+function createFileRuntimeStore() {
+    return {
+        async readLastRun() {
+            if (!fs.existsSync(LAST_RUN_FILE)) {
+                return '';
+            }
+            return fs.readFileSync(LAST_RUN_FILE, 'utf8').trim();
+        },
+        async writeLastRun(todayKey) {
+            fs.writeFileSync(LAST_RUN_FILE, todayKey, 'utf8');
+        },
+        async readHistory() {
+            // Local mode: prefer the live history file, fall back to the seed
+            const fileHistory = readHistoryFile(HISTORY_FILE);
+            if (Object.keys(fileHistory).length > 0) {
+                return fileHistory;
+            }
+            return readHistoryFile(HISTORY_SEED_FILE);
+        },
+        async writeHistory(historyStore) {
+            fs.writeFileSync(HISTORY_FILE, JSON.stringify(historyStore, null, 2), 'utf8');
+        },
+        async close() {
+            return undefined;
+        }
+    };
+}
+
+// ── Date Helpers (timezone-safe) ─────────────────────────────────────────────
+
+// Parse a "YYYY-MM-DD" date string at LOCAL noon to avoid UTC-midnight boundary
+// bugs that would otherwise misclassify items near the day boundary.
+function parseDateKey(dateText) {
+    const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(dateText || '');
+    if (!match) {
+        const parsed = new Date(dateText);
+        return Number.isNaN(parsed.getTime()) ? null : parsed;
+    }
+    const [, year, month, day] = match;
+    return new Date(Number(year), Number(month) - 1, Number(day), 12, 0, 0, 0);
+}
+
+function formatDateKey(date) {
+    return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
+}
+
+// Pull the most-recent status-change timestamp out of Monday's status column
+// `value` JSON. Returns a Date or null.
+function parseStatusChangedAt(statusValue) {
+    if (!statusValue) return null;
+    try {
+        const parsed = JSON.parse(statusValue);
+        if (parsed && parsed.changed_at) {
+            const changed = new Date(parsed.changed_at);
+            if (!Number.isNaN(changed.getTime())) return changed;
+        }
+    } catch (err) {
+        // Malformed JSON — treat as no fallback
+    }
+    return null;
+}
+
+// Hybrid closure date: prefer the manually-entered DATE_CLOSED column,
+// fall back to the most-recent status-change timestamp.
+function parseClosedEventAt(dateClosedText, fallbackChangedAt) {
+    if (dateClosedText) {
+        const closedDate = parseDateKey(dateClosedText);
+        if (closedDate) return closedDate;
+    }
+    return fallbackChangedAt || null;
+}
+
+// ── History Helpers ──────────────────────────────────────────────────────────
+
+function readHistoryFile(filePath) {
+    if (!fs.existsSync(filePath)) {
+        return {};
+    }
+    try {
+        return JSON.parse(fs.readFileSync(filePath, 'utf8'));
+    } catch (err) {
+        console.error(`   ⚠️ Unable to read history file ${filePath}: ${err.message}`);
+        return {};
+    }
+}
+
+function mergeDateStores(primaryStore, secondaryStore) {
+    const merged = {};
+    const allDates = new Set([
+        ...Object.keys(primaryStore || {}),
+        ...Object.keys(secondaryStore || {})
+    ]);
+    [...allDates].sort().forEach(date => {
+        merged[date] = {
+            ...(primaryStore?.[date] || {}),
+            ...(secondaryStore?.[date] || {})
+        };
+    });
+    return merged;
+}
+
+function pruneHistory(historyStore, retentionDays) {
+    const retentionDate = new Date();
+    retentionDate.setDate(retentionDate.getDate() - retentionDays);
+    Object.keys(historyStore).forEach(date => {
+        const parsed = parseDateKey(date);
+        if (parsed && parsed < retentionDate) {
+            delete historyStore[date];
+        }
+    });
 }
 
 function generateCSV(boardStats, recentItems, agingItems) {
@@ -391,7 +557,10 @@ function generateSparklineHTML(points, days) {
 
     const cutoff = new Date();
     cutoff.setDate(cutoff.getDate() - days);
-    const filtered = points.filter(p => new Date(p.date) >= cutoff);
+    const filtered = points.filter(p => {
+        const d = parseDateKey(p.date);
+        return d && d >= cutoff;
+    });
     if (filtered.length < 3) return '<span style="color: #94a3b8; font-size: 11px;">&#8212;</span>';
 
     // Sample down to ~15 bars max for compact display
