@@ -11,7 +11,9 @@ module.exports = {
         'Site Locations and Contacts',
         'IMC TOR1',
         'Field Service Template',
-        'IMC TOR 1 201089 Cost Only'
+        'IMC TOR 1 201089 Cost Only',
+        'Shipping Process Proof of Concept',
+        'Subcontracting Job Tracker'
     ],
 
     // Statuses considered "open" for tracking

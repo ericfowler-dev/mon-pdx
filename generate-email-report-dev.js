@@ -910,7 +910,7 @@ function generateEmailHTML(workspaceName, boardStats, recentItems, comparisonDat
                                     <th style="padding: 10px 4px; text-align: center; white-space: nowrap;">Hlth</th>
                                     <th style="padding: 10px 4px; text-align: center; white-space: nowrap;">Tot</th>
                                 </tr>
-                                ${boardStats.sort((a,b) => b.newLast10 - a.newLast10).map((b, idx) => `
+                                ${boardStats.filter(b => b.openItems > 0).sort((a,b) => b.newLast10 - a.newLast10).map((b, idx) => `
                                 <tr style="font-size: 12px; background-color: ${idx % 2 === 0 ? '#ffffff' : '#f8fafc'}; border-bottom: 1px solid #e2e8f0;">
                                     <td style="font-weight: bold; padding: 8px; color: #334155; word-break: break-word;">${b.name}${b.isNewBoard ? ' <span style="background: #8b5cf6; color: white; padding: 1px 5px; font-size: 9px; border-radius: 3px;">NEW</span>' : ''}</td>
                                     <td align="center" style="padding: 8px 4px; background-color: ${getHeatColor(b.newLast5, maxNew5)}; white-space: nowrap;">${b.newLast5}</td>
