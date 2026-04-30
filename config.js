@@ -29,7 +29,7 @@ module.exports = {
     // Health score targets (used for weighted calculation)
     // OPEN_TARGET: Expected "healthy" backlog size per board. Lower = stricter scoring.
     // Boards with openItems >> OPEN_TARGET will score lower on backlog health.
-    OPEN_TARGET: 20,
+    OPEN_TARGET: 30,
 
     // Aging thresholds in days
     AGING_THRESHOLDS: {
