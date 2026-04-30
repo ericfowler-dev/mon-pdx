@@ -13,7 +13,8 @@ module.exports = {
         'Field Service Template',
         'IMC TOR 1 201089 Cost Only',
         'Shipping Process Proof of Concept',
-        'Subcontracting Job Tracker'
+        'Subcontracting Job Tracker',
+        'TEST BOARD for adding issue problem,
     ],
 
     // Statuses considered "open" for tracking
