@@ -15,6 +15,7 @@ module.exports = {
         'Shipping Process Proof of Concept',
         'Subcontracting Job Tracker',
         'TEST BOARD for adding issue problem',
+        'Issue Adding Test Page',
     ],
 
     // Statuses considered "open" for tracking
