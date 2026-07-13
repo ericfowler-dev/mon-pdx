@@ -16,6 +16,8 @@ module.exports = {
         'Subcontracting Job Tracker',
         'TEST BOARD for adding issue problem',
         'Issue Adding Test Page',
+        'Unit Info Mirror Column Trial',
+        'Order Tracker',
     ],
 
     // Statuses considered "open" for tracking
