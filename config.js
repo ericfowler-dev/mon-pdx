@@ -21,7 +21,7 @@ module.exports = {
     ],
 
     // Statuses considered "open" for tracking
-    OPEN_STATUSES: ['Initiated', 'Open', 'In-Process', 'In Progress', 'New Issue','Ready to Schedule','Service in progress','Waiting for Engineering','Scheduled','Service In Progress'],
+    OPEN_STATUSES: ['Initiated', 'Open', 'In-Process', 'In Progress', 'New Issue','Ready to Schedule','Service in progress','Waiting for Engineering','Scheduled','Service In Progress','Field Review'],
 
     // Statuses considered "closed" for throughput tracking (expanded per user feedback)
     CLOSED_STATUSES: ['Complete', 'Completed', 'Closed', 'Done', 'Resolved', 'Review Status', 'Pending', 'Cancelled', 'Non-Issue', 'CAR Pending', 'CX Alloy Update', 'CxA (Iconicx) Pending Verification', 'Review', 'Pending Job', 'Stack Verification'],
