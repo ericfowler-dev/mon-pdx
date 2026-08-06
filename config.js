@@ -18,6 +18,7 @@ module.exports = {
         'Issue Adding Test Page',
         'Unit Info Mirror Column Trial',
         'Order Tracker',
+        'Automation / Practice Board',
     ],
 
     // Statuses considered "open" for tracking
