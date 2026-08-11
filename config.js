@@ -19,6 +19,7 @@ module.exports = {
         'Unit Info Mirror Column Trial',
         'Order Tracker',
         'Automation / Practice Board',
+        'IMC Cost Only',
     ],
 
     // Statuses considered "open" for tracking
