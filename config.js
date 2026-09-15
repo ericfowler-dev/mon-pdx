@@ -20,6 +20,7 @@ module.exports = {
         'Order Tracker',
         'Automation / Practice Board',
         'IMC Cost Only',
+        'IMC'
     ],
 
     // Statuses considered "open" for tracking
